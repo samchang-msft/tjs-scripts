@@ -66,8 +66,9 @@ for per-consumer billing dashboards via KQL.
 > **Important**: Application Insights must have **custom metrics with dimensions**
 > enabled, otherwise the `llm-emit-token-metric` policy will send metrics but
 > strip the dimension values — making per-consumer queries return empty results.
-> This is configured automatically via `azapi_update_resource` in `main.tf`
-> (setting `CustomMetricsOptedInType = "WithDimensions"`). If deploying
+> This is configured automatically in `main.tf` via a Terraform-managed
+> ARM `PATCH` (`az rest`) that sets
+> `CustomMetricsOptedInType = "WithDimensions"`. If deploying
 > manually, enable it in the portal under **Application Insights → Usage and
 > estimated costs → Custom metrics (Preview) → With dimensions**.
 

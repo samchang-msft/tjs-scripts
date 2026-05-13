@@ -42,16 +42,43 @@ resource "azurerm_application_insights" "this" {
   tags                = var.tags
 }
 
-# Enable custom metrics with dimensions (required for llm-emit-token-metric)
-resource "azapi_update_resource" "appinsights_custom_metrics" {
-  type        = "Microsoft.Insights/components@2020-02-02"
-  resource_id = azurerm_application_insights.this.id
-
-  body = {
-    properties = {
-      CustomMetricsOptedInType = "WithDimensions"
-    }
+# Enable custom metrics with dimensions (required for llm-emit-token-metric).
+# Uses ARM PATCH via Azure CLI because azapi_update_resource does not persist
+# this property reliably for this resource type.
+resource "terraform_data" "appinsights_custom_metrics" {
+  lifecycle {
+    replace_triggered_by = [azurerm_application_insights.this]
   }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      set -euo pipefail
+
+      resource_id="${azurerm_application_insights.this.id}"
+      api_version="2020-02-02"
+
+      az rest \
+        --method patch \
+        --url "https://management.azure.com$${resource_id}?api-version=$${api_version}" \
+        --headers "Content-Type=application/json" \
+        --body '{"properties":{"CustomMetricsOptedInType":"WithDimensions"}}' \
+        -o none
+
+      actual="$(az rest \
+        --method get \
+        --url "https://management.azure.com$${resource_id}?api-version=$${api_version}" \
+        --query "properties.CustomMetricsOptedInType" \
+        -o tsv)"
+
+      if [[ "$${actual}" != "WithDimensions" ]]; then
+        echo "CustomMetricsOptedInType was not persisted (actual='$${actual}')." >&2
+        exit 1
+      fi
+    EOT
+  }
+
+  depends_on = [azurerm_application_insights.this]
 }
 
 # =============================================================================
