@@ -4,7 +4,7 @@ terraform {
   required_providers {
     azurerm = {
       source  = "hashicorp/azurerm"
-      version = "~> 4.68"
+      version = "~> 4.73"
     }
     azapi = {
       source  = "azure/azapi"
@@ -16,7 +16,7 @@ terraform {
     }
     random = {
       source  = "hashicorp/random"
-      version = "~> 3.6"
+      version = "~> 3.9"
     }
     # Google provider for Gemini API resources (API key, enabled services).
     # Auth via `gcloud auth application-default login` — same pattern as az login.

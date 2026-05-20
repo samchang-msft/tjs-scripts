@@ -6,8 +6,10 @@ resource "random_pet" "suffix" {
 }
 
 locals {
-  suffix = random_pet.suffix.id
-  name   = "${var.name_prefix}${local.suffix}"
+  suffix                = random_pet.suffix.id
+  name                  = "${var.name_prefix}${local.suffix}"
+  foundry_account_name  = "fndry-${local.name}"
+  foundry_resource_id   = "/subscriptions/${data.azurerm_client_config.current.subscription_id}/resourceGroups/rg-${local.name}/providers/Microsoft.CognitiveServices/accounts/${local.foundry_account_name}"
 }
 
 # =============================================================================
@@ -85,14 +87,49 @@ resource "terraform_data" "appinsights_custom_metrics" {
 # AI Foundry — Cognitive Services (AIServices) + Project + Deployments
 # =============================================================================
 
+# Purge soft-deleted Foundry resource if it exists.
+# Uses Cognitive Services deleted-account API and purges only tombstone entries.
+resource "null_resource" "purge_foundry" {
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<-EOT
+      set -euo pipefail
+      deleted_id="$(az cognitiveservices account list-deleted \
+        --query "[?name=='${local.foundry_account_name}' && contains(id, '/resourceGroups/${azurerm_resource_group.this.name}/')].id | [0]" \
+        -o tsv 2>/dev/null || true)"
+
+      if [[ -n "$${deleted_id}" && "$${deleted_id}" != "null" ]]; then
+        az cognitiveservices account purge \
+          --name "${local.foundry_account_name}" \
+          --resource-group "${azurerm_resource_group.this.name}" \
+          --location "${var.location}" \
+          -o none
+
+        for _ in {1..30}; do
+          still_deleted="$(az cognitiveservices account list-deleted \
+            --query "[?name=='${local.foundry_account_name}' && contains(id, '/resourceGroups/${azurerm_resource_group.this.name}/')].id | [0]" \
+            -o tsv 2>/dev/null || true)"
+          if [[ -z "$${still_deleted}" || "$${still_deleted}" == "null" ]]; then
+            break
+          fi
+          sleep 3
+        done
+      fi
+    EOT
+  }
+  triggers = {
+    always_run = timestamp()
+  }
+}
+
 resource "azurerm_cognitive_account" "foundry" {
-  name                = "fndry-${local.name}"
+  name                = local.foundry_account_name
   resource_group_name = azurerm_resource_group.this.name
   location            = azurerm_resource_group.this.location
   kind                = "AIServices"
   sku_name            = var.foundry_sku
 
-  custom_subdomain_name      = "fndry-${local.name}"
+  custom_subdomain_name      = local.foundry_account_name
   project_management_enabled = true
 
   identity {
@@ -100,6 +137,8 @@ resource "azurerm_cognitive_account" "foundry" {
   }
 
   tags = var.tags
+
+  depends_on = [null_resource.purge_foundry]
 }
 
 resource "azurerm_cognitive_deployment" "chat" {
@@ -269,6 +308,42 @@ resource "google_apikeys_key" "gemini" {
 # API Management
 # =============================================================================
 
+# Purge soft-deleted APIM service if it exists.
+# Uses APIM deleted-service API and purges only tombstone entries.
+resource "null_resource" "purge_apim" {
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<-EOT
+      set -euo pipefail
+
+      deleted_location="$(az apim deletedservice list \
+        --query "[?name=='apim-${local.name}' && contains(serviceId, '/resourceGroups/${azurerm_resource_group.this.name}/')].location | [0]" \
+        -o tsv 2>/dev/null || true)"
+
+      if [[ -n "$${deleted_location}" && "$${deleted_location}" != "null" ]]; then
+        az apim deletedservice purge \
+          --service-name "apim-${local.name}" \
+          --location "$${deleted_location}" \
+          -o none
+
+        for _ in {1..30}; do
+          still_deleted="$(az apim deletedservice list \
+            --query "[?name=='apim-${local.name}' && contains(serviceId, '/resourceGroups/${azurerm_resource_group.this.name}/')].name | [0]" \
+            -o tsv 2>/dev/null || true)"
+          if [[ -z "$${still_deleted}" || "$${still_deleted}" == "null" ]]; then
+            break
+          fi
+          sleep 3
+        done
+      fi
+    EOT
+  }
+
+  triggers = {
+    always_run = timestamp()
+  }
+}
+
 resource "azurerm_api_management" "this" {
   name                = "apim-${local.name}"
   resource_group_name = azurerm_resource_group.this.name
@@ -282,26 +357,96 @@ resource "azurerm_api_management" "this" {
   }
 
   tags = var.tags
+
+  depends_on = [null_resource.purge_apim]
+}
+
+# Wait until APIM control plane reports fully provisioned AND API is responsive.
+# Polls provisioningState, then verifies API responsiveness via read-only diagnostic-settings list.
+resource "terraform_data" "apim_ready" {
+  lifecycle {
+    replace_triggered_by = [azurerm_api_management.this]
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      set -euo pipefail
+
+      apim_name="${azurerm_api_management.this.name}"
+      rg_name="${azurerm_resource_group.this.name}"
+      subscription_id="${data.azurerm_client_config.current.subscription_id}"
+      resource_id="/subscriptions/$${subscription_id}/resourceGroups/$${rg_name}/providers/Microsoft.ApiManagement/service/$${apim_name}"
+
+      for _ in {1..120}; do
+        state="$(az apim show \
+          --name "$${apim_name}" \
+          --resource-group "$${rg_name}" \
+          --query "provisioningState" \
+          -o tsv 2>/dev/null || true)"
+
+        if [[ "$${state}" == "Succeeded" ]]; then
+          # Verify APIM API is responsive by listing diagnostic settings
+          if az monitor diagnostic-settings list \
+            --resource "$${resource_id}" \
+            >/dev/null 2>&1; then
+            exit 0
+          fi
+        fi
+
+        sleep 10
+      done
+
+      echo "Timed out waiting for APIM to be fully ready for diagnostic settings." >&2
+      exit 1
+    EOT
+  }
+
+  depends_on = [azurerm_api_management.this]
 }
 
 # APIM Diagnostic Setting — sends platform logs/metrics to Log Analytics
-resource "azurerm_monitor_diagnostic_setting" "apim" {
-  name                           = "apim-to-log-analytics"
-  target_resource_id             = azurerm_api_management.this.id
-  log_analytics_workspace_id     = azurerm_log_analytics_workspace.this.id
-  log_analytics_destination_type = "Dedicated"
+# Managed via AzAPI to avoid create collision on first-run eventual consistency edges.
+resource "azapi_update_resource" "apim_diagnostic_setting" {
+  type        = "Microsoft.Insights/diagnosticSettings@2021-05-01-preview"
+  resource_id = "${azurerm_api_management.this.id}/providers/Microsoft.Insights/diagnosticSettings/apim-to-log-analytics"
 
-  enabled_log {
-    category_group = "allLogs"
+  body = {
+    properties = {
+      workspaceId                 = azurerm_log_analytics_workspace.this.id
+      logAnalyticsDestinationType = "Dedicated"
+      logs = [
+        {
+          categoryGroup = "allLogs"
+          enabled       = true
+          retentionPolicy = {
+            enabled = false
+            days    = 0
+          }
+        },
+        {
+          categoryGroup = "audit"
+          enabled       = true
+          retentionPolicy = {
+            enabled = false
+            days    = 0
+          }
+        }
+      ]
+      metrics = [
+        {
+          category = "AllMetrics"
+          enabled  = true
+          retentionPolicy = {
+            enabled = false
+            days    = 0
+          }
+        }
+      ]
+    }
   }
 
-  enabled_log {
-    category_group = "audit"
-  }
-
-  enabled_metric {
-    category = "AllMetrics"
-  }
+  depends_on = [terraform_data.apim_ready]
 }
 
 # APIM Logger — Application Insights
@@ -314,6 +459,8 @@ resource "azurerm_api_management_logger" "appinsights" {
   application_insights {
     connection_string = azurerm_application_insights.this.connection_string
   }
+
+  depends_on = [terraform_data.apim_ready]
 }
 
 resource "azurerm_api_management_diagnostic" "appinsights" {
@@ -346,6 +493,8 @@ resource "azurerm_api_management_diagnostic" "appinsights" {
   backend_response {
     body_bytes = 8192
   }
+
+  depends_on = [terraform_data.apim_ready]
 }
 
 # API-level diagnostic — enables Application Insights on the OpenAI API
@@ -563,6 +712,8 @@ resource "azurerm_api_management_backend" "chat" {
   lifecycle {
     ignore_changes = [circuit_breaker_rule]
   }
+
+  depends_on = [terraform_data.apim_ready]
 }
 
 # Circuit breaker on the Foundry chat backend (not yet in azurerm — use azapi)
@@ -607,6 +758,8 @@ resource "azurerm_api_management_backend" "embeddings" {
     validate_certificate_chain = true
     validate_certificate_name  = true
   }
+
+  depends_on = [terraform_data.apim_ready]
 }
 
 # Gemini backend — Google AI OpenAI-compatible endpoint (API key auth via Key Vault)
@@ -630,7 +783,10 @@ resource "azurerm_api_management_backend" "gemini" {
     validate_certificate_name  = true
   }
 
-  depends_on = [azurerm_api_management_named_value.gemini_api_key]
+  depends_on = [
+    terraform_data.apim_ready,
+    azurerm_api_management_named_value.gemini_api_key,
+  ]
 }
 
 # Anthropic backend — Foundry Claude endpoint (managed identity auth)
@@ -647,11 +803,15 @@ resource "azurerm_api_management_backend" "anthropic" {
     validate_certificate_chain = true
     validate_certificate_name  = true
   }
+
+  depends_on = [terraform_data.apim_ready]
 }
 
 # =============================================================================
 # APIM — Products
 # =============================================================================
+
+# TODO Delete starter & unlimited products. Otherwise subsequent deployments/destroys will fail (they have subscriptions)
 
 resource "azurerm_api_management_product" "standard" {
   product_id            = "ai-standard"
@@ -662,6 +822,8 @@ resource "azurerm_api_management_product" "standard" {
   subscription_required = true
   approval_required     = false
   published             = true
+
+  depends_on = [terraform_data.apim_ready]
 }
 
 resource "azurerm_api_management_product" "premium" {
@@ -673,6 +835,8 @@ resource "azurerm_api_management_product" "premium" {
   subscription_required = true
   approval_required     = false
   published             = true
+
+  depends_on = [terraform_data.apim_ready]
 }
 
 # =============================================================================
@@ -722,6 +886,8 @@ resource "azurerm_api_management_api" "openai" {
     header = "api-key"
     query  = "api-key"
   }
+
+  depends_on = [terraform_data.apim_ready]
 }
 
 # Wildcard operations to proxy all OpenAI-compatible paths
@@ -781,6 +947,8 @@ resource "azurerm_api_management_api" "anthropic" {
     header = "api-key"
     query  = "api-key"
   }
+
+  depends_on = [terraform_data.apim_ready]
 }
 
 resource "azurerm_api_management_api_operation" "anthropic_post" {
@@ -1015,7 +1183,10 @@ resource "azurerm_api_management_named_value" "gemini_api_key" {
     secret_id = azurerm_key_vault_secret.gemini_api_key[0].versionless_id
   }
 
-  depends_on = [azurerm_role_assignment.kv_apim_secrets_user]
+  depends_on = [
+    terraform_data.apim_ready,
+    azurerm_role_assignment.kv_apim_secrets_user,
+  ]
 }
 
 # Optional consumer test secrets
